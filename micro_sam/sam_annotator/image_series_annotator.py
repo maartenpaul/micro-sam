@@ -83,7 +83,7 @@ def _initialize_annotator(
     viewer, image, image_embedding_path,
     model_type, halo, tile_shape, predictor, decoder, is_volumetric,
     precompute_amg_state, checkpoint_path, device, embedding_path,
-    segmentation_path,
+    segmentation_path, output_folder=None, commit_path=None,
 ):
     if viewer is None:
         viewer = napari.Viewer()
@@ -98,6 +98,7 @@ def _initialize_annotator(
     )
     state.image_shape = _get_input_shape(image, is_volumetric)
 
+    # Create the specific annotator (which contains the commit widget)
     if is_volumetric:
         if image.ndim not in [3, 4]:
             raise ValueError(f"Invalid image dimensions for 3d annotator, expect 3 or 4 dimensions, got {image.ndim}")
@@ -107,14 +108,30 @@ def _initialize_annotator(
             raise ValueError(f"Invalid image dimensions for 2d annotator, expect 2 or 3 dimensions, got {image.ndim}")
         annotator = Annotator2d(viewer)
 
+    # Load existing segmentation if available
     if os.path.exists(segmentation_path):
         segmentation_result = imageio.imread(segmentation_path)
     else:
         segmentation_result = None
     annotator._update_image(segmentation_result=segmentation_result)
 
-    # Add the annotator widget to the viewer and sync widgets.
+    # Add the annotator widget to the viewer FIRST
     viewer.window.add_dock_widget(annotator)
+
+    # After adding annotator to viewer, set commit path on the commit widget
+    try:
+        commit_widget = annotator._widgets.get("commit")
+        if commit_widget is not None:
+            if commit_path:
+                commit_widget.commit_path.value = commit_path
+            elif output_folder:
+                default_cp = os.path.join(output_folder, "prompts")
+                os.makedirs(default_cp, exist_ok=True)
+                commit_widget.commit_path.value = default_cp
+    except Exception:
+        pass
+
+    # Sync other widgets
     _sync_embedding_widget(
         widget=state.widgets["embeddings"],
         model_type=model_type if checkpoint_path is None else state.predictor.model_type,
@@ -142,6 +159,7 @@ def image_series_annotator(
     device: Optional[Union[str, torch.device]] = None,
     prefer_decoder: bool = True,
     skip_segmented: bool = True,
+    commit_path: Optional[str] = None,
 ) -> Optional["napari.viewer.Viewer"]:
     """Run the annotation tool for a series of images (supported for both 2d and 3d images).
 
@@ -167,12 +185,16 @@ def image_series_annotator(
         skip_segmented: Whether to skip images that were already segmented.
             If set to False, then segmentations that already exist will be loaded
             and used to populate the 'committed_objects' layer.
+        commit_path: Path where to save the committed results and prompts.
+            If provided, the segmentations and prompts will be saved in zarr format.
 
     Returns:
         The napari viewer, only returned if `return_viewer=True`.
     """
     end_msg = "You have annotated the last image. Do you wish to close napari?"
     os.makedirs(output_folder, exist_ok=True)
+    if commit_path is not None:
+        os.makedirs(commit_path, exist_ok=True)
 
     # Precompute embeddings and amg state (if corresponding options set).
     predictor, decoder, embedding_paths = _precompute(
@@ -192,6 +214,113 @@ def image_series_annotator(
             fname = os.path.basename(image_path)
             fname = os.path.splitext(fname)[0] + ".tif"
         return os.path.join(output_folder, fname)
+
+    def _get_prompt_save_path(image_path, current_idx):
+        if commit_path is None:
+            return None
+        if have_inputs_as_arrays:
+            fname = f"prompt_{current_idx:05}.json"
+        else:
+            fname = os.path.basename(image_path)
+            fname = os.path.splitext(fname)[0] + ".json"
+        return os.path.join(commit_path, fname)
+
+    def _get_commit_path_for_image(image_path, current_idx):
+        """Get the zarr path for a specific image.
+        
+        In the 2D annotator, commit_path is a specific zarr file.
+        In the image series annotator, commit_path is a folder where individual
+        zarr files are created for each image.
+        """
+        if commit_path is None:
+            return None
+            
+        # Create a unique zarr file name for each image that matches the segmentation filename pattern
+        if have_inputs_as_arrays:
+            # For array inputs, use the same pattern as segmentation files
+            zarr_name = f"seg_{current_idx:05}.zarr"
+        else:
+            # For file inputs, use the original image name
+            fname = os.path.basename(image_path)
+            zarr_name = os.path.splitext(fname)[0] + ".zarr"
+            
+        # Return the full path to the zarr file
+        return os.path.join(commit_path, zarr_name)
+
+    def _save_segmentation(image_path, current_idx, segmentation):
+        save_path = _get_save_path(image_path, current_idx)
+        imageio.imwrite(save_path, segmentation)
+
+    def _save_with_commit(image_path, current_idx, viewer, segmentation):
+        # First save the segmentation using standard format
+        _save_segmentation(image_path, current_idx, segmentation)
+        
+        # Only try to save prompts if there are actually any prompts
+        if commit_path is not None:
+            # First we need to create a mask and bounding box since _commit_to_file requires them
+            # The mask should indicate which parts of the segmentation are valid (non-zero)
+            mask = segmentation != 0
+            
+            # Check if we actually have any objects to save
+            object_ids = np.unique(segmentation[mask]) if mask.any() else []
+            
+            # Skip saving if there are no objects or if the only object is background (0)
+            if len(object_ids) == 0:
+                return
+                
+            # Using the entire segmentation as the bounding box, as we're committing the whole image
+            bb = np.s_[:]  # Full slice for the whole image
+            
+            # Get the actual path for this particular image
+            image_commit_path = _get_commit_path_for_image(image_path, current_idx)
+            
+            # Use a custom handler based on _commit_to_file but without the assertion
+            if image_commit_path is not None:
+                try:
+                    # If we have no prompts but have objects (e.g. loaded from previously existing segmentation),
+                    # we need to handle this specially
+                    point_prompts = viewer.layers["point_prompts"].data
+                    shape_prompts = viewer.layers["prompts"].data
+                    
+                    if len(point_prompts) == 0 and len(shape_prompts) == 0 and len(object_ids) > 0:
+                        # For objects without prompts, use a simplified save without attempting to save prompts
+                        import os
+                        import json
+                        import z5py
+                        
+                        # Create the directory if it doesn't exist
+                        os.makedirs(os.path.dirname(image_commit_path), exist_ok=True)
+                        
+                        # Deal with issues z5py has with empty folders
+                        if os.path.exists(image_commit_path):
+                            required_json = os.path.join(image_commit_path, ".zgroup")
+                            if not os.path.exists(required_json):
+                                with open(required_json, "w") as f:
+                                    json.dump({"zarr_format": 2}, f)
+                        
+                        # Open the zarr file
+                        f = z5py.ZarrFile(image_commit_path, "a")
+                        
+                        # Save the segmentation without prompts
+                        full_shape = segmentation.shape
+                        block_shape = util.get_block_shape(full_shape)
+                        ds = f.require_dataset(
+                            "committed_objects", shape=full_shape, chunks=block_shape, 
+                            compression="gzip", dtype=segmentation.dtype
+                        )
+                        data = ds[bb]
+                        data[mask] = segmentation[mask]
+                        ds[bb] = data
+                        
+                        # Add metadata noting this was saved without prompts
+                        f.attrs["saved_without_prompts"] = True
+                        f.attrs["has_objects"] = True
+                    else:
+                        # Normal case: use standard _commit_to_file
+                        widgets._commit_to_file(image_commit_path, viewer, "current_object", segmentation, mask, bb)
+                except Exception as e:
+                    print(f"Error saving prompts to {image_commit_path}: {e}")
+                    # Continue without crashing - we already saved the segmentation
 
     def _load_image(image_id):
         image = images[next_image_id]
@@ -221,18 +350,22 @@ def image_series_annotator(
 
     # Initialize the viewer and annotator for this image.
     state = AnnotatorState()
+    # Compute the zarr file path for this first image
+    first_commit_file = _get_commit_path_for_image(images[next_image_id], next_image_id)
     viewer, annotator = _initialize_annotator(
         viewer, image, image_embedding_path,
         model_type, halo, tile_shape, predictor, decoder, is_volumetric,
         precompute_amg_state, checkpoint_path, device, embedding_path,
-        save_path,
+        save_path, output_folder, first_commit_file,
     )
 
-    def _save_segmentation(image_path, current_idx, segmentation):
-        save_path = _get_save_path(image_path, next_image_id)
-        imageio.imwrite(save_path, segmentation, compression="zlib")
+    # Set the commit widget to point to the per-image zarr file
+    commit_file = first_commit_file
+    commit_w = annotator._widgets.get("commit")
+    if commit_w is not None and commit_file is not None:
+        os.makedirs(os.path.dirname(commit_file), exist_ok=True)
+        commit_w.commit_path.value = commit_file
 
-    # Add functionality for going to the next image.
     @magicgui(call_button="Next Image [N]")
     def next_image(*args):
         nonlocal next_image_id
@@ -245,8 +378,17 @@ def image_series_annotator(
             if abort:
                 return
 
-        # Save the current segmentation.
+        # Save the current segmentation to TIFF
         _save_segmentation(images[next_image_id], next_image_id, segmentation)
+        
+        # Only try to save prompts if we have uncommitted prompts
+        # Check if we have any point prompts or shape prompts that haven't been committed
+        point_prompts = viewer.layers["point_prompts"].data
+        shape_prompts = viewer.layers["prompts"].data
+        
+        if len(point_prompts) > 0 or len(shape_prompts) > 0:
+            # We have uncommitted prompts, save them with the segmentation
+            _save_with_commit(images[next_image_id], next_image_id, viewer, segmentation)
 
         # Clear the segmentation already to avoid lagging removal.
         viewer.layers["committed_objects"].data = np.zeros_like(viewer.layers["committed_objects"].data)
@@ -312,6 +454,13 @@ def image_series_annotator(
         state.image_shape = _get_input_shape(image, is_volumetric)
 
         annotator._update_image(segmentation_result=segmentation_result)
+        
+        # Update commit widget for the new image
+        commit_file = _get_commit_path_for_image(images[next_image_id], next_image_id)
+        commit_w = annotator._widgets.get("commit")
+        if commit_w is not None and commit_file is not None:
+            os.makedirs(os.path.dirname(commit_file), exist_ok=True)
+            commit_w.commit_path.value = commit_file
 
     viewer.window.add_dock_widget(next_image)
 
@@ -330,6 +479,7 @@ def image_folder_annotator(
     pattern: str = "*",
     viewer: Optional["napari.viewer.Viewer"] = None,
     return_viewer: bool = False,
+    commit_path: Optional[str] = None,
     **kwargs
 ) -> Optional["napari.viewer.Viewer"]:
     """Run the 2d annotation tool for a series of images in a folder.
@@ -342,6 +492,8 @@ def image_folder_annotator(
         viewer: The viewer to which the Segment Anything functionality should be added.
             This enables using a pre-initialized viewer.
         return_viewer: Whether to return the napari viewer to further modify it before starting the tool.
+        commit_path: Path where to save the committed results and prompts in zarr format.
+            If None, prompts won't be saved.
         kwargs: The keyword arguments for `micro_sam.sam_annotator.image_series_annotator`.
 
     Returns:
@@ -350,7 +502,8 @@ def image_folder_annotator(
     image_files = sorted(glob(os.path.join(input_folder, pattern)))
 
     return image_series_annotator(
-        image_files, output_folder, viewer=viewer, return_viewer=return_viewer, **kwargs
+        image_files, output_folder, viewer=viewer, return_viewer=return_viewer, 
+        commit_path=commit_path, **kwargs
     )
 
 
@@ -384,6 +537,14 @@ class ImageSeriesAnnotator(widgets._WidgetBase):
             "output_folder", self.output_folder, "directory",
             title="Output Folder", placeholder="Folder to save the results ...",
             tooltip=get_tooltip("image_series_annotator", "output_folder")
+        )
+        self.layout().addLayout(layout)
+
+        self.commit_path = None
+        _, layout = self._add_path_param(
+            "commit_path", self.commit_path, "directory",
+            title="Commit Path", placeholder="Folder to save prompts and results (optional) ...",
+            tooltip="Select a folder where prompt annotations and results will be saved in zarr format."
         )
         self.layout().addLayout(layout)
 
@@ -467,7 +628,12 @@ class ImageSeriesAnnotator(widgets._WidgetBase):
             return
         tile_shape, halo = widgets._process_tiling_inputs(self.tile_x, self.tile_y, self.halo_x, self.halo_y)
 
-        image_folder_annotator(
+        # Store the commit path before passing it to image_folder_annotator
+        # so we can ensure it's properly set in the commit widget
+        commit_path_value = self.commit_path
+
+        # Run the annotator
+        viewer = image_folder_annotator(
             input_folder=self.folder,
             output_folder=self.output_folder,
             pattern=self.pattern,
@@ -476,7 +642,16 @@ class ImageSeriesAnnotator(widgets._WidgetBase):
             tile_shape=tile_shape, halo=halo, checkpoint_path=self.custom_weights,
             device=self.device, is_volumetric=self.is_volumetric,
             viewer=self._viewer, return_viewer=True,
+            commit_path=commit_path_value,
         )
+        
+        # After the annotator is initialized, ensure the commit widget has the correct path
+        # This step is crucial because the commit widget might be recreated or reset
+        state = widgets.AnnotatorState()
+        if commit_path_value and hasattr(state.widgets, "commit") and state.widgets.get("commit") is not None:
+            # Directly set the commit_path value in the commit widget
+            # This ensures it's visible in the UI and used for saving
+            state.widgets["commit"].commit_path.value = commit_path_value
 
 
 def main():
@@ -505,6 +680,11 @@ def main():
         help="The filepath for saving/loading the pre-computed image embeddings. "
         "NOTE: It is recommended to pass this argument and store the embeddings, "
         "otherwise they will be recomputed every time (which can take a long time)."
+    )
+    parser.add_argument(
+        "--commit_path",
+        help="The filepath for saving the committed results and prompts in zarr format. "
+        "Each image will have its own zarr file with the same naming pattern as the segmentation results."
     )
     parser.add_argument(
         "-m", "--model_type", default=util._DEFAULT_MODEL,
@@ -540,5 +720,6 @@ def main():
         embedding_path=args.embedding_path, model_type=args.model_type,
         tile_shape=args.tile_shape, halo=args.halo, precompute_amg_state=args.precompute_amg_state,
         checkpoint_path=args.checkpoint, device=args.device, is_volumetric=args.is_volumetric,
-        prefer_decoder=args.prefer_decoder, skip_segmented=args.skip_segmented
+        prefer_decoder=args.prefer_decoder, skip_segmented=args.skip_segmented,
+        commit_path=args.commit_path
     )
