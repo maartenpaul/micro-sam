@@ -1,0 +1,25 @@
+[project] # Using [project] is standard for modern Pixi
+name = "micro-sam-integration"
+version = "0.1.0"
+description = "Project using micro-sam and zeroc-ice"
+authors = ["Maarten Paul <maarten.paul@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["win-64"] # Note: This configuration is specific to Windows 64-bit
+
+[tasks]
+# Define project tasks here
+# e.g., run_script = "python your_script.py"
+
+[dependencies]
+# Python 3.12 is required by the zeroc_ice wheel ('cp312')
+python = ">=3.12,<3.13"
+
+# Conda dependency for micro_sam
+micro_sam = ">=1.4.0,<2"
+
+# Add other conda dependencies here (e.g., numpy, pandas)
+
+[pypi-dependencies]
+# Install zeroc_ice wheel from URL using pip
+zeroc-ice = { url = "https://github.com/glencoesoftware/zeroc-ice-py-win-x86_64/releases/download/20240325/zeroc_ice-3.6.5-cp312-cp312-win_amd64.whl" }
+# The 'zeroc-ice' key is for Pixi's internal tracking; pip uses the actual package name from the wheel file.

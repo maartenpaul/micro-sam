@@ -200,3 +200,7 @@ iterative_prompting_results/
 data/
 embeddings/
 *.zarr
+
+# pixi environments
+.pixi
+*.egg-info
