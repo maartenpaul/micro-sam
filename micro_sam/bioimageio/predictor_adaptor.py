@@ -26,9 +26,18 @@ class PredictorAdaptor(nn.Module):
             Can be one of 'vit_b', 'vit_l', 'vit_h' or 'vit_t'.
             For 'vit_t' support the 'mobile_sam' package has to be installed.
     """
-    def __init__(self, model_type: str) -> None:
+    def __init__(self, model_type: str, device: Optional[str] = None) -> None:
         super().__init__()
+        # Optional preferred device; if None we will adapt to the input tensor device at runtime
+        self.device: Optional[str] = device
         sam_model = sam_model_registry[model_type]()
+        # Move the underlying SAM model to the desired device if specified
+        if self.device is not None:
+            try:
+                sam_model = sam_model.to(self.device)
+            except Exception:
+                # Fallback to CPU if moving fails
+                sam_model = sam_model.cpu()
         self.sam = SamPredictor(sam_model)
 
     def load_state_dict(self, state):
@@ -59,6 +68,27 @@ class PredictorAdaptor(nn.Module):
             The scores for prediction quality.
             The computed image embeddings.
         """
+        # Ensure model and inputs are on the same device
+        desired_device = self.device if self.device is not None else image.device
+        if image.device != torch.device('cuda'):
+            image = image.to('cuda')
+        # Move prompts/embeddings if provided
+        if box_prompts is not None and box_prompts.device != torch.device(desired_device):
+            box_prompts = box_prompts.to(desired_device)
+        if point_prompts is not None and point_prompts.device != torch.device(desired_device):
+            point_prompts = point_prompts.to(desired_device)
+        if point_labels is not None and point_labels.device != torch.device(desired_device):
+            point_labels = point_labels.to(desired_device)
+        if mask_prompts is not None and mask_prompts.device != torch.device(desired_device):
+            mask_prompts = mask_prompts.to(desired_device)
+        if embeddings is not None and embeddings.device != torch.device(desired_device):
+            embeddings = embeddings.to(desired_device)
+
+        # Move the SAM model if it is not on the same device as the image
+        model_device = next(self.sam.model.parameters()).device
+        if model_device != torch.device(desired_device):
+            self.sam.model = self.sam.model.to(desired_device)
+
         batch_size = image.shape[0]
         if batch_size != 1:
             raise ValueError

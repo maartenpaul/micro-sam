@@ -41,7 +41,7 @@ DEFAULTS = {
 ARBITRARY_SIZE = spec.ParameterizedSize(min=1, step=1)
 
 
-def _create_test_inputs_and_outputs(image, labels, model_type, checkpoint_path, tmp_dir):
+def _create_test_inputs_and_outputs(image, labels, model_type, checkpoint_path, tmp_dir, device: Optional[str] = None):
 
     # For now we just generate a single box prompt here, but we could also generate more input prompts.
     generator = PointAndBoxPromptGenerator(
@@ -64,20 +64,43 @@ def _create_test_inputs_and_outputs(image, labels, model_type, checkpoint_path, 
         [_compute_logits_from_mask(labels == 1), _compute_logits_from_mask(labels == 2)]
     )[None]
 
-    predictor = PredictorAdaptor(model_type=model_type)
-    predictor.load_state_dict(torch.load(checkpoint_path))
+    predictor = PredictorAdaptor(model_type=model_type, device=device)
+    # Load weights on CPU first to avoid device mismatch during load; the model is moved later as needed.
+    predictor.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
 
     input_ = util._to_image(image).transpose(2, 0, 1)[None]
     image_path = os.path.join(tmp_dir, "input.npy")
     np.save(image_path, input_)
 
+    # Create tensors; device alignment is handled inside the predictor as well, but we try to align here too.
+    img_t = torch.from_numpy(input_)
+    bp_t = torch.from_numpy(box_prompts)
+    pp_t = torch.from_numpy(point_prompts)
+    pl_t = torch.from_numpy(point_labels)
+    mp_t = torch.from_numpy(mask_prompts)
+
+    if device is not None:
+        try:
+            img_t = img_t.to(device)
+            bp_t = bp_t.to(device)
+            pp_t = pp_t.to(device)
+            pl_t = pl_t.to(device)
+            mp_t = mp_t.to(device)
+        except Exception:
+            # Fall back to CPU tensors if the requested device is not available
+            img_t = img_t.cpu()
+            bp_t = bp_t.cpu()
+            pp_t = pp_t.cpu()
+            pl_t = pl_t.cpu()
+            mp_t = mp_t.cpu()
+
     masks, scores, embeddings = predictor(
-        image=torch.from_numpy(input_),
+        image=img_t,
         embeddings=None,
-        box_prompts=torch.from_numpy(box_prompts),
-        point_prompts=torch.from_numpy(point_prompts),
-        point_labels=torch.from_numpy(point_labels),
-        mask_prompts=torch.from_numpy(mask_prompts),
+        box_prompts=bp_t,
+        point_prompts=pp_t,
+        point_labels=pl_t,
+        mask_prompts=mp_t,
     )
 
     box_prompt_path = os.path.join(tmp_dir, "box_prompts.npy")
@@ -92,9 +115,9 @@ def _create_test_inputs_and_outputs(image, labels, model_type, checkpoint_path, 
     mask_path = os.path.join(tmp_dir, "mask.npy")
     score_path = os.path.join(tmp_dir, "scores.npy")
     embed_path = os.path.join(tmp_dir, "embeddings.npy")
-    np.save(mask_path, masks.numpy())
-    np.save(score_path, scores.numpy())
-    np.save(embed_path, embeddings.numpy())
+    np.save(mask_path, masks.detach().cpu().numpy())
+    np.save(score_path, scores.detach().cpu().numpy())
+    np.save(embed_path, embeddings.detach().cpu().numpy())
 
     inputs = {
         "image": image_path,
@@ -274,6 +297,7 @@ def export_sam_model(
     name: str,
     output_path: Union[str, os.PathLike],
     checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+    device: Optional[str] = None,
     **kwargs
 ) -> None:
     """Export SAM model to BioImage.IO model format.
@@ -290,10 +314,14 @@ def export_sam_model(
         output_path: Where the exported model is saved.
         checkpoint_path: Optional checkpoint for loading the SAM model.
     """
+    # Default device selection: if not specified, use CUDA when available, else CPU.
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         checkpoint_path, decoder_path = _get_checkpoint(model_type, checkpoint_path, tmp_dir)
         input_paths, result_paths = _create_test_inputs_and_outputs(
-            image, label_image, model_type, checkpoint_path, tmp_dir,
+            image, label_image, model_type, checkpoint_path, tmp_dir, device=device,
         )
         input_descriptions = [
             # First input: the image data.
@@ -308,7 +336,7 @@ def export_sam_model(
                     spec.SpaceInputAxis(id=spec.AxisId("x"), size=ARBITRARY_SIZE),
                 ],
                 test_tensor=spec.FileDescr(source=input_paths["image"]),
-                data=spec.IntervalOrRatioDataDescr(type="uint8")
+                data=spec.IntervalOrRatioDataDescr(type="float32")
             ),
 
             # Second input: the box prompts (optional)
